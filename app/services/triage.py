@@ -1,12 +1,12 @@
-"""Triage service: a two-stage, model-routed classification pipeline.
+"""Triage service: two-stage, model-routed, token-optimized classification.
 
-Stage 1 (prescreen, fast model): decide simple vs complex.
-Stage 2 (triage, routed): classify with the fast model for simple tickets and
-the smart model for complex ones.
+Stage 1 (prescreen, fast model): simple vs complex.
+Stage 2 (triage, routed): fast model for simple tickets, smart model for complex.
 
-The `ModelRouter` owns every model choice; this service just asks it which
-model to use for each task. `classify()` remains the Step 2 contract (returns
-a `TriageResult`); `triage()` additionally reports the routing decision.
+Every call applies the Step 7 optimizations: the right-sized model per task
+(routing), the stable system prompt sent as a cached block (prompt caching),
+and a per-task output budget (max_tokens). Usage is logged and, optionally,
+accumulated in a UsageTracker for cost reporting.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from app.prompts.prescreen import (
 from app.prompts.triage import build_system_prompt, build_user_prompt
 from app.services.claude_client import get_claude_client
 from app.services.model_router import ModelRouter
+from app.services.usage import UsageTracker, log_usage
+from app.utils.caching import to_cached_system
 from app.utils.parsing import ParseError, parse_json_object
 
 logger = get_logger(__name__)
@@ -47,12 +49,13 @@ class TriageDecision:
 
 
 class TriageService:
-    """Classifies support messages with cost-aware model routing."""
+    """Classifies support messages with cost-aware routing and caching."""
 
-    def __init__(self) -> None:
+    def __init__(self, tracker: UsageTracker | None = None) -> None:
         self._client = get_claude_client()
         self._settings = get_settings()
         self._router = ModelRouter()
+        self._tracker = tracker
         self._triage_system_prompt = build_system_prompt()
         self._prescreen_system_prompt = build_prescreen_system_prompt()
 
@@ -69,71 +72,66 @@ class TriageService:
 
         logger.info("Triage pipeline started (%d chars)", len(message))
 
-        # Stage 1: lightweight prescreen on the fast model.
         prescreen = self._prescreen(message)
-        prescreen_model = self._router.model_for(TaskType.PRESCREEN)
-
-        # Stage 2: route the triage task by complexity.
         triage_task = (
             TaskType.TRIAGE_COMPLEX
             if prescreen.complexity == Complexity.COMPLEX
             else TaskType.TRIAGE_SIMPLE
         )
-        triage_model = self._router.model_for(triage_task)
-        logger.info(
-            "Prescreen=%s -> task=%s -> model=%s",
-            prescreen.complexity,
-            triage_task.value,
-            triage_model,
-        )
+        result = self._run_triage(message, triage_task)
 
-        result = self._run_triage(message, triage_model)
         logger.info(
-            "Triage: urgency=%s topic=%s team=%s",
+            "Triage: urgency=%s topic=%s team=%s (%s)",
             result.urgency,
             result.topic,
             result.assigned_team,
+            self._router.model_for(triage_task),
         )
 
         return TriageDecision(
             result=result,
             complexity=Complexity(prescreen.complexity),
-            prescreen_model=prescreen_model,
+            prescreen_model=self._router.model_for(TaskType.PRESCREEN),
             triage_task=triage_task,
-            triage_model=triage_model,
+            triage_model=self._router.model_for(triage_task),
         )
 
     # -- Stages ------------------------------------------------------------
 
     def _prescreen(self, message: str) -> PrescreenResult:
-        """Stage 1: fast simple/complex judgment."""
-        model = self._router.model_for(TaskType.PRESCREEN)
         text = self._complete(
-            model=model,
-            system_prompt=self._prescreen_system_prompt,
-            user_content=build_prescreen_user_prompt(message),
+            TaskType.PRESCREEN,
+            self._prescreen_system_prompt,
+            build_prescreen_user_prompt(message),
         )
         return self._validate(text, PrescreenResult)
 
-    def _run_triage(self, message: str, model: str) -> TriageResult:
-        """Stage 2: full classification on the routed model."""
+    def _run_triage(self, message: str, task: TaskType) -> TriageResult:
         text = self._complete(
-            model=model,
-            system_prompt=self._triage_system_prompt,
-            user_content=build_user_prompt(message),
+            task,
+            self._triage_system_prompt,
+            build_user_prompt(message),
         )
         return self._validate(text, TriageResult)
 
     # -- Helpers -----------------------------------------------------------
 
-    def _complete(self, model: str, system_prompt: str, user_content: str) -> str:
-        """Single Messages API call; return concatenated text content."""
+    def _complete(self, task: TaskType, system_prompt: str, user_content: str) -> str:
+        """One Messages API call, applying routing, caching, and budgeting."""
+        model = self._router.model_for(task)             # optimization #1: routing
+        max_tokens = self._router.max_tokens_for(task)   # optimization #3: budget
+
         response = self._client.messages.create(
             model=model,
-            max_tokens=self._settings.max_tokens,
-            system=system_prompt,
+            max_tokens=max_tokens,
+            system=to_cached_system(system_prompt),      # optimization #2: caching
             messages=[{"role": "user", "content": user_content}],
         )
+
+        log_usage(task, response.model, response.usage)
+        if self._tracker is not None:
+            self._tracker.record(task, response.model, response.usage)
+
         parts = [block.text for block in response.content if block.type == "text"]
         text = "".join(parts).strip()
         if not text:
@@ -142,7 +140,6 @@ class TriageService:
 
     @staticmethod
     def _validate(text: str, model_cls: type[BaseModel]):
-        """Parse JSON from model output and validate against a Pydantic model."""
         try:
             payload = parse_json_object(text)
         except ParseError as exc:
@@ -150,6 +147,4 @@ class TriageService:
         try:
             return model_cls.model_validate(payload)
         except ValidationError as exc:
-            raise TriageError(
-                f"{model_cls.__name__} validation failed: {exc}"
-            ) from exc
+            raise TriageError(f"{model_cls.__name__} validation failed: {exc}") from exc

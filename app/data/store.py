@@ -50,6 +50,31 @@ ORDERS: dict[str, dict[str, Any]] = {
     },
 }
 
+SUBSCRIPTIONS: dict[str, dict[str, Any]] = {
+    "CUST-001": {
+        "customer_id": "CUST-001",
+        "plan": "Enterprise",
+        "status": "active",
+        "seats": 50,
+        "renews_on": "2026-01-15",
+        "mrr_usd": 5000.00,
+    },
+    "CUST-002": {
+        "customer_id": "CUST-002",
+        "plan": "Pro",
+        "status": "past_due",
+        "seats": 5,
+        "renews_on": "2025-08-01",
+        "mrr_usd": 49.00,
+    },
+}
+
+
+def find_subscription(customer_id: str) -> dict[str, Any] | None:
+    """Look up a customer's subscription by ID. Returns None if absent."""
+    return SUBSCRIPTIONS.get(customer_id)
+
+
 # --- Ticket store -----------------------------------------------------------
 
 _TICKETS: dict[str, dict[str, Any]] = {}

@@ -1,8 +1,10 @@
-"""Application entrypoint — Step 9 GitHub MCP demo.
+"""Application entrypoint — Step 12 end-to-end pipeline demo.
 
-Prints the MCP connection configuration, then (if GITHUB_TOKEN and GITHUB_REPO
-are set) asks Claude to search for a login-related issue and create one if none
-exists — exercising the search/create/update issue tools over MCP.
+Runs one support message through the full pipeline:
+    Classification -> Parallel Tool Calls -> GitHub MCP -> Slack MCP -> Final Response
+and prints a stage-by-stage report plus a token-usage/cost summary.
+
+GitHub and Slack stages are skipped cleanly if their tokens are not configured.
 
 Usage:
     venv/Scripts/python.exe main.py
@@ -10,52 +12,82 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+
 from app.core.logging import get_logger
-from app.services.github_mcp import GitHubMCPError, GitHubMCPService
+from app.services.orchestrator import SupportPipeline
 
 logger = get_logger(__name__)
 
-INSTRUCTION = (
-    "Search the repository's open issues for anything about login failures. "
-    "If you find no matching open issue, create one titled 'Login failures "
-    "reported by customers' with a short body noting that multiple customers "
-    "report failed logins. Then summarize what you did."
-)
+TICKET = {
+    "message": (
+        "Our production checkout has been throwing 500 errors ever since your "
+        "latest update this morning. It's blocking all customer purchases and "
+        "we're losing sales by the minute. Please help urgently."
+    ),
+    "customer_id": "CUST-001",
+    "order_id": "ORD-1001",
+}
+
+
+async def run() -> None:
+    pipeline = SupportPipeline()
+
+    print("=" * 70)
+    print("SUPPORT MESSAGE")
+    print("=" * 70)
+    print(TICKET["message"])
+    print(f"\n(customer_id={TICKET['customer_id']}, order_id={TICKET['order_id']})\n")
+
+    result = await pipeline.run(
+        TICKET["message"],
+        customer_id=TICKET["customer_id"],
+        order_id=TICKET["order_id"],
+        on_token=None,  # final reply captured; set to a printer to stream live
+    )
+
+    d = result.decision
+    print("=" * 70)
+    print("1. CLASSIFICATION")
+    print("=" * 70)
+    print(f"  urgency       : {d.result.urgency}")
+    print(f"  topic         : {d.result.topic}")
+    print(f"  assigned_team : {d.result.assigned_team}")
+    print(f"  reason        : {d.result.reason}")
+    print(f"  complexity    : {d.complexity}  (prescreen: {d.prescreen_model})")
+    print(f"  triage model  : {d.triage_model}")
+
+    e = result.enrichment
+    print("\n" + "=" * 70)
+    print(f"2. PARALLEL TOOL CALLS  (wall time {e.wall_ms:.0f}ms)")
+    print("=" * 70)
+    print(f"  customer     : {e.customer}")
+    print(f"  order        : {e.order}")
+    print(f"  subscription : {e.subscription}")
+
+    print("\n" + "=" * 70)
+    print("3. GITHUB MCP")
+    print("=" * 70)
+    print(f"  [{result.github.status}] {result.github.detail}")
+
+    print("\n" + "=" * 70)
+    print("4. SLACK MCP")
+    print("=" * 70)
+    print(f"  [{result.slack.status}] {result.slack.detail}")
+
+    print("\n" + "=" * 70)
+    print("5. FINAL RESPONSE (to customer)")
+    print("=" * 70)
+    print(result.final_reply)
+
+    print("\n" + "=" * 70)
+    print("TOKEN USAGE & COST")
+    print("=" * 70)
+    print(pipeline.tracker.report(compare_model="claude-sonnet-4-5"))
 
 
 def main() -> None:
-    service = GitHubMCPService()
-
-    print("=== GitHub MCP connection ===")
-    for key, value in service.describe_connection().items():
-        print(f"  {key:16s}: {value}")
-    print()
-
-    if not service.describe_connection()["token_configured"]:
-        print("GITHUB_TOKEN is not set. Add a PAT (and GITHUB_REPO) to .env to run live.")
-        print("The connection above shows how Claude is wired to the GitHub MCP server.")
-        return
-
-    print("=== Instruction ===")
-    print(INSTRUCTION)
-    print()
-
-    try:
-        result = service.run(INSTRUCTION)
-    except GitHubMCPError as exc:
-        print(f"ERROR: {exc}")
-        return
-
-    print("=== GitHub tools Claude called ===")
-    for i, call in enumerate(result.tool_calls, start=1):
-        print(f"{i}. {call.name}  input={call.input}")
-    if not result.tool_calls:
-        print("(none)")
-    print()
-
-    print("=== Summary ===")
-    print(result.summary)
-    print(f"\n[model: {result.model}]")
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
